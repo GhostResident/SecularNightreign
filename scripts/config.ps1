@@ -16,7 +16,7 @@ $PatchUrls = @{
     Part1 = 'https://github.com/Elixir-Raj/nightreign-updates/releases/download/v1.03.1-1.03.2/elamigos-1.bin.part1'
     Part2 = 'https://github.com/Elixir-Raj/nightreign-updates/releases/download/v1.03.1-1.03.2/elamigos-1.bin.part2'
   }
-  '1.3.3' = @{ Zip = '' }
+  '1.3.3' = @{ Zip = 'https://github.com/GhostResident/SecularNightreign/releases/download/game-patches/nightreign-patch-1.03.3.zip' }
 }
 
 $RawUrl = "https://raw.githubusercontent.com/$Repo/$Branch"
