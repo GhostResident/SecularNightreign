@@ -1,33 +1,39 @@
 [package]
-name = "secular-nightreign-launcher"
-version = "1.0.0"
+name = "nightreign-updater"
+version = "1.1.2"
 edition = "2024"
-description = "Native installer and launcher for Secular Nightreign"
-license = "MIT"
+description = "Nightreign patch manager for Windows"
+
+[[bin]]
+name = "launcher"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = "=2.6.3"
 
 [dependencies]
 anyhow = "1.0"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
-crossbeam-channel = "0.5"
-dirs = "6.0"
-eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow"] }
-hex = "0.4"
-regex = "1.12"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
-rfd = "0.15"
+dunce = "1.0"
+regex = "1.13"
+reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "rustls-tls"] }
+semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-sysinfo = "0.37"
-tempfile = "3.23"
-tokio = { version = "1.48", features = ["rt", "time"] }
-zip = { version = "6.0", default-features = false, features = ["deflate"] }
-
-[build-dependencies]
-winresource = "0.1"
+tauri = "=2.11.5"
+zip = { version = "=2.4.2", default-features = false, features = ["deflate"] }
+windows = { version = "=0.61.3", features = ["Win32_System_Com", "Win32_UI_Shell"] }
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
-strip = true
 lto = "thin"
-codegen-units = 1
-panic = "abort"
+strip = "debuginfo"

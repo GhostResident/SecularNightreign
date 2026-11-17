@@ -1,207 +1,371 @@
-use anyhow::{Context, Result, bail};
 use std::{
-    fs,
+    collections::HashSet,
+    ffi::{OsStr, OsString},
+    io,
+    mem::size_of,
+    os::windows::{
+        ffi::{OsStrExt, OsStringExt},
+        io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    },
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    ptr::{self, null, null_mut},
+    sync::LazyLock,
+    time::{Duration, Instant},
 };
-use sysinfo::{ProcessesToUpdate, System};
 
-use crate::config::{APP_EXE, GAME_EXE, GAME_PROCESS, SEAMLESS_EXE, SHORTCUT_NAME};
+use anyhow::{Context, Result, bail};
+use regex::Regex;
+use windows::{
+    Win32::{
+        Foundation::HWND,
+        System::Com::{
+            CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+            CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize,
+        },
+        UI::Shell::{
+            FOLDERID_Downloads, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog,
+            IFileOpenDialog, KNOWN_FOLDER_FLAG, SHGetKnownFolderPath, SIGDN_FILESYSPATH,
+        },
+    },
+    core::{HRESULT, w},
+};
+use windows_sys::Win32::{
+    Foundation::{HWND as RawWindow, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    Storage::FileSystem::{
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VS_FIXEDFILEINFO, VerQueryValueW,
+    },
+    System::{
+        Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            TH32CS_SNAPPROCESS,
+        },
+        Threading::{GetExitCodeProcess, GetProcessId, WaitForSingleObject},
+    },
+    UI::{
+        Shell::{
+            SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+            ShellExecuteExW,
+        },
+        WindowsAndMessaging::{
+            EnumChildWindows, EnumWindows, GetWindowTextW, GetWindowThreadProcessId,
+            IsWindowVisible, PostMessageW, SMTO_ABORTIFHUNG, SW_SHOWNORMAL, SendMessageTimeoutW,
+            WM_CLOSE, WM_GETTEXT,
+        },
+    },
+};
 
-pub fn normalize_game_dir(input: &Path) -> Option<PathBuf> {
-    let direct = input.join(GAME_EXE);
-    if direct.is_file() {
-        return fs::canonicalize(input)
-            .ok()
-            .or_else(|| Some(input.to_path_buf()));
-    }
-    let nested = input.join("Game");
-    if nested.join(GAME_EXE).is_file() {
-        return fs::canonicalize(&nested).ok().or(Some(nested));
-    }
-    None
+fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
+    value.as_ref().encode_wide().chain([0]).collect()
 }
 
-pub fn game_is_running() -> bool {
-    let mut system = System::new();
-    system.refresh_processes(ProcessesToUpdate::All, true);
-    system.processes().values().any(|p| {
-        p.name()
-            .to_string_lossy()
-            .eq_ignore_ascii_case(GAME_PROCESS)
+struct Apartment;
+
+impl Apartment {
+    fn enter() -> Result<Self> {
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE).ok()?;
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for Apartment {
+    fn drop(&mut self) {
+        unsafe { CoUninitialize() };
+    }
+}
+
+pub fn browse_folder(owner: usize) -> Result<Option<String>> {
+    let _apartment = Apartment::enter()?;
+    // The dialog and its COM interfaces live on this STA thread.
+    unsafe {
+        let dialog: IFileOpenDialog =
+            CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+        dialog.SetOptions(dialog.GetOptions()? | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM)?;
+        dialog.SetTitle(w!("Выберите папку"))?;
+        match dialog.Show(Some(HWND(owner as _))) {
+            Err(error) if error.code() == HRESULT(0x800704c7_u32 as i32) => return Ok(None),
+            other => other?,
+        }
+        let item = dialog.GetResult()?;
+        let pointer = item.GetDisplayName(SIGDN_FILESYSPATH)?;
+        let path = pointer.to_string();
+        CoTaskMemFree(Some(pointer.0.cast()));
+        Ok(Some(path?))
+    }
+}
+
+pub fn downloads() -> Result<PathBuf> {
+    unsafe {
+        let raw = SHGetKnownFolderPath(&FOLDERID_Downloads, KNOWN_FOLDER_FLAG(0), None)?;
+        let path = OsString::from_wide(raw.as_wide());
+        CoTaskMemFree(Some(raw.0.cast()));
+        Ok(path.into())
+    }
+}
+
+pub fn open_folder(path: &Path) -> Result<()> {
+    let _apartment = Apartment::enter()?;
+    shell_execute(path, None, None, false).map(|_| ())
+}
+
+pub fn file_version(path: &Path) -> Option<String> {
+    let path = wide(path);
+    let mut reserved = 0;
+    let size = unsafe { GetFileVersionInfoSizeW(path.as_ptr(), &mut reserved) };
+    if size == 0 || size > 1024 * 1024 {
+        return None;
+    }
+    let mut data = vec![0_u8; size as usize];
+    unsafe {
+        if GetFileVersionInfoW(path.as_ptr(), 0, size, data.as_mut_ptr().cast()) == 0 {
+            return None;
+        }
+    }
+    let query = |key: &str| {
+        let key = wide(key);
+        let mut value = null_mut();
+        let mut len = 0;
+        let ok =
+            unsafe { VerQueryValueW(data.as_ptr().cast(), key.as_ptr(), &mut value, &mut len) };
+        (ok != 0 && !value.is_null()).then_some((value, len as usize))
+    };
+    let checked_bytes = |pointer: *mut std::ffi::c_void, bytes: usize| {
+        let start = pointer.addr().checked_sub(data.as_ptr().addr())?;
+        data.get(start..start.checked_add(bytes)?)
+    };
+    if let Some((value, len)) = query(r"\VarFileInfo\Translation")
+        && let Some(languages) = checked_bytes(value, len)
+    {
+        for language in languages.chunks_exact(4) {
+            let id = u16::from_le_bytes([language[0], language[1]]);
+            let page = u16::from_le_bytes([language[2], language[3]]);
+            let key = format!(r"\StringFileInfo\{id:04x}{page:04x}\FileVersion");
+            if let Some((text, len)) = query(&key)
+                && let Some(bytes) = len.checked_mul(2).and_then(|len| checked_bytes(text, len))
+            {
+                let text: Vec<_> = bytes
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                let version = String::from_utf16_lossy(&text)
+                    .trim_matches('\0')
+                    .trim()
+                    .to_owned();
+                if !version.is_empty() {
+                    return Some(version);
+                }
+            }
+        }
+    }
+    let (value, len) = query("\\")?;
+    if len < size_of::<VS_FIXEDFILEINFO>() {
+        return None;
+    }
+    let info = checked_bytes(value, size_of::<VS_FIXEDFILEINFO>())?;
+    let fixed = unsafe { ptr::read_unaligned(info.as_ptr().cast::<VS_FIXEDFILEINFO>()) };
+    (fixed.dwSignature == 0xfeef04bd).then(|| {
+        format!(
+            "{}.{}.{}.{}",
+            fixed.dwFileVersionMS >> 16,
+            fixed.dwFileVersionMS & 0xffff,
+            fixed.dwFileVersionLS >> 16,
+            fixed.dwFileVersionLS & 0xffff
+        )
     })
 }
 
-pub fn launch_game(game: &Path) -> Result<()> {
-    let seamless = game.join(SEAMLESS_EXE);
-    let executable = if seamless.is_file() {
-        seamless
-    } else {
-        game.join(GAME_EXE)
+fn shell_execute(
+    path: &Path,
+    arguments: Option<&OsStr>,
+    cwd: Option<&Path>,
+    process: bool,
+) -> Result<Option<OwnedHandle>> {
+    let path = wide(path);
+    let arguments = arguments.map(wide);
+    let cwd = cwd.map(wide);
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOASYNC
+            | SEE_MASK_FLAG_NO_UI
+            | if process { SEE_MASK_NOCLOSEPROCESS } else { 0 },
+        lpFile: path.as_ptr(),
+        lpParameters: arguments.as_ref().map_or(null(), |arg| arg.as_ptr()),
+        lpDirectory: cwd.as_ref().map_or(null(), |dir| dir.as_ptr()),
+        nShow: SW_SHOWNORMAL,
+        ..Default::default()
     };
-    Command::new(&executable)
-        .current_dir(game)
-        .spawn()
-        .with_context(|| format!("не удалось запустить {}", executable.display()))?;
-    Ok(())
+    if unsafe { ShellExecuteExW(&mut info) } == 0 {
+        return Err(io::Error::last_os_error()).context("Windows не смог открыть файл");
+    }
+    Ok((!info.hProcess.is_null()).then(|| unsafe { OwnedHandle::from_raw_handle(info.hProcess) }))
 }
 
-pub fn game_version(game: &Path) -> Result<String> {
-    let exe = game.join(GAME_EXE);
-    let escaped = exe.to_string_lossy().replace('\'', "''");
-    let script = format!("(Get-Item -LiteralPath '{escaped}').VersionInfo.FileVersion");
-    let output = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &script,
-        ])
-        .creation_flags(0x0800_0000)
-        .output()
-        .context("не удалось прочитать версию nightreign.exe")?;
-    if !output.status.success() {
-        bail!("Windows не смог прочитать версию nightreign.exe");
-    }
-    let raw = String::from_utf8_lossy(&output.stdout);
-    let mut numbers: Vec<u32> = raw
-        .trim()
-        .split('.')
-        .filter_map(|part| part.trim().parse().ok())
-        .collect();
-    if numbers.is_empty() {
-        bail!("неизвестный формат версии: {raw}");
-    }
-    while numbers.len() > 3 && numbers.last() == Some(&0) {
-        numbers.pop();
-    }
-    while numbers.len() < 3 {
-        numbers.push(0);
-    }
-    Ok(format!("{}.{}.{}", numbers[0], numbers[1], numbers[2]))
-}
-
-pub fn install_root(game: &Path) -> &Path {
-    if game
+pub fn install(exe: &Path, root: &Path, tick: impl Fn(u64, Option<&str>)) -> Result<()> {
+    let _apartment = Apartment::enter()?;
+    let name = exe
         .file_name()
-        .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("Game"))
-    {
-        game.parent().unwrap_or(game)
+        .context("Нет имени установщика")?
+        .to_string_lossy()
+        .to_lowercase();
+    let args = if name.contains("setup") && !name.contains("nightreign") {
+        // NSIS reads /D= literally from the end of the Windows command line.
+        let mut args = OsString::from("/S /D=");
+        args.push(root);
+        args
     } else {
-        game
-    }
-}
-
-pub fn open_folder(path: &Path) {
-    let _ = Command::new("explorer.exe").arg(path).spawn();
-}
-
-fn ps_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-pub fn create_shortcut(game: &Path, launcher: &Path) -> Result<()> {
-    let desktop = dirs::desktop_dir().context("не найдена папка рабочего стола")?;
-    let shortcut = desktop.join(SHORTCUT_NAME);
-    let script = format!(
-        "$w=New-Object -ComObject WScript.Shell;$s=$w.CreateShortcut({});$s.TargetPath={};$s.WorkingDirectory={};$s.IconLocation={};$s.Description='Секулярный мод: обновление и запуск игры';$s.Save()",
-        ps_literal(&shortcut.to_string_lossy()),
-        ps_literal(&launcher.to_string_lossy()),
-        ps_literal(&game.to_string_lossy()),
-        ps_literal(&format!("{},0", game.join(GAME_EXE).display())),
-    );
-    let status = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &script,
-        ])
-        .creation_flags(0x0800_0000)
-        .status()
-        .context("не удалось создать ярлык")?;
-    if !status.success() {
-        bail!("PowerShell не смог создать ярлык на рабочем столе");
-    }
-    Ok(())
-}
-
-pub fn remove_shortcut() {
-    if let Some(desktop) = dirs::desktop_dir() {
-        fs::remove_file(desktop.join(SHORTCUT_NAME)).ok();
-    }
-}
-
-pub fn copy_launcher(game: &Path) -> Result<PathBuf> {
-    let home = game.join("SecularMod");
-    fs::create_dir_all(&home)?;
-    let destination = home.join(APP_EXE);
-    let current = std::env::current_exe()?;
-    if !same_path(&current, &destination) {
-        fs::copy(&current, &destination).with_context(|| {
-            format!("не удалось скопировать лаунчер в {}", destination.display())
-        })?;
-    }
-    Ok(destination)
-}
-
-pub fn same_path(a: &Path, b: &Path) -> bool {
-    let clean = |p: &Path| {
-        p.to_string_lossy()
-            .trim_end_matches(['\\', '/'])
-            .to_lowercase()
+        let mut args = OsString::from("/VERYSILENT /SUPPRESSMSGBOXES /NOCANCEL /NORESTART /DIR=\"");
+        args.push(root);
+        args.push("\"");
+        args
     };
-    clean(a) == clean(b)
-}
-
-pub fn schedule_self_directory_removal(dir: &Path) -> Result<()> {
-    let pid = std::process::id();
-    let escaped = dir.to_string_lossy().replace('\'', "''");
-    let script = format!(
-        "Wait-Process -Id {pid} -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 300; Remove-Item -LiteralPath '{escaped}' -Recurse -Force -ErrorAction SilentlyContinue"
-    );
-    Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-WindowStyle",
-            "Hidden",
-            "-Command",
-            &script,
-        ])
-        .creation_flags(0x0800_0000)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let process = shell_execute(exe, Some(&args), exe.parent(), true)?
+        .context("Windows не вернул процесс установщика")?;
+    let handle = process.as_raw_handle();
+    let pid = unsafe { GetProcessId(handle) };
+    let start = Instant::now();
+    let mut known_children = HashSet::from([pid]);
+    let mut elapsed_notice = false;
+    loop {
+        match unsafe { WaitForSingleObject(handle, 3000) } {
+            WAIT_OBJECT_0 => break,
+            WAIT_TIMEOUT => {}
+            _ => {
+                return Err(io::Error::last_os_error()).context("Не удалось дождаться установщика");
+            }
+        }
+        let elapsed = start.elapsed();
+        let closed_crc = close_finished_crc(pid, &mut known_children);
+        let mut message = closed_crc.then_some("RapidCRC закончил проверку и закрыт");
+        if !elapsed_notice && elapsed >= Duration::from_secs(1200) {
+            elapsed_notice = true;
+            message = Some("Установщик работает дольше 20 минут. Ожидаем его завершения.");
+        }
+        tick(elapsed.as_secs(), message);
+    }
+    let mut code = 0;
+    if unsafe { GetExitCodeProcess(handle, &mut code) } == 0 {
+        return Err(io::Error::last_os_error()).context("Не удалось узнать код установщика");
+    }
+    if code != 0 {
+        bail!("Установщик завершился с кодом {code}");
+    }
     Ok(())
 }
 
-#[cfg(windows)]
-trait CommandExtHidden {
-    fn creation_flags(&mut self, flags: u32) -> &mut Self;
-}
-
-#[cfg(windows)]
-impl CommandExtHidden for Command {
-    fn creation_flags(&mut self, flags: u32) -> &mut Self {
-        std::os::windows::process::CommandExt::creation_flags(self, flags);
-        self
+fn visit_processes(mut visit: impl FnMut(&PROCESSENTRY32W) -> bool) -> io::Result<()> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
     }
-}
-
-#[cfg(not(windows))]
-trait CommandExtHidden {
-    fn creation_flags(&mut self, _flags: u32) -> &mut Self;
-}
-
-#[cfg(not(windows))]
-impl CommandExtHidden for Command {
-    fn creation_flags(&mut self, _flags: u32) -> &mut Self {
-        self
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
+    let raw = snapshot.as_raw_handle();
+    let mut process = PROCESSENTRY32W {
+        dwSize: size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    if unsafe { Process32FirstW(raw, &mut process) } == 0 {
+        return Err(io::Error::last_os_error());
     }
+    while visit(&process) && unsafe { Process32NextW(raw, &mut process) } != 0 {}
+    Ok(())
+}
+
+pub fn nightreign_running() -> Result<bool> {
+    let mut running = false;
+    visit_processes(|process| {
+        let name = process
+            .szExeFile
+            .split(|&c| c == 0)
+            .next()
+            .unwrap_or_default();
+        running = OsString::from_wide(name).eq_ignore_ascii_case("nightreign.exe");
+        !running
+    })
+    .context("Не удалось проверить, закрыта ли игра")?;
+    Ok(running)
+}
+
+fn close_finished_crc(pid: u32, known: &mut HashSet<u32>) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let mut processes = Vec::new();
+    if visit_processes(|entry| {
+        processes.push((entry.th32ProcessID, entry.th32ParentProcessID));
+        true
+    })
+    .is_err()
+    {
+        return false;
+    }
+    loop {
+        let before = known.len();
+        for &(child, parent) in &processes {
+            if known.contains(&parent) {
+                known.insert(child);
+            }
+        }
+        if known.len() == before {
+            break;
+        }
+    }
+
+    struct Scan<'a> {
+        children: &'a HashSet<u32>,
+        closed: bool,
+    }
+    unsafe extern "system" fn scan_window(hwnd: RawWindow, data: isize) -> i32 {
+        let scan = unsafe { &mut *(data as *mut Scan<'_>) };
+        let mut pid = 0;
+        let mut title = [0_u16; 256];
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        if !scan.children.contains(&pid) || unsafe { IsWindowVisible(hwnd) } == 0 {
+            return 1;
+        }
+        let count = unsafe { GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32) };
+        if count > 0
+            && String::from_utf16_lossy(&title[..count as usize])
+                .to_lowercase()
+                .contains("rapidcrc")
+        {
+            let mut done = false;
+            unsafe { EnumChildWindows(hwnd, Some(scan_control), &mut done as *mut bool as isize) };
+            if done && unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) } != 0 {
+                scan.closed = true;
+            }
+        }
+        1
+    }
+    unsafe extern "system" fn scan_control(hwnd: RawWindow, data: isize) -> i32 {
+        static DONE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"(?i)\b([1-9]\d*)\s*/\s*(\d+)\s*done\b").unwrap());
+        let mut text = [0_u16; 512];
+        let mut count = 0;
+        let ok = unsafe {
+            SendMessageTimeoutW(
+                hwnd,
+                WM_GETTEXT,
+                text.len(),
+                text.as_mut_ptr() as isize,
+                SMTO_ABORTIFHUNG,
+                100,
+                &mut count,
+            )
+        };
+        if ok != 0 && count > 0 && count < text.len() {
+            let text = String::from_utf16_lossy(&text[..count]);
+            if DONE.captures_iter(&text).any(|hit| hit[1] == hit[2]) {
+                unsafe { *(data as *mut bool) = true };
+                return 0;
+            }
+        }
+        1
+    }
+    let mut scan = Scan {
+        children: known,
+        closed: false,
+    };
+    unsafe { EnumWindows(Some(scan_window), &mut scan as *mut Scan<'_> as isize) };
+    scan.closed
 }
